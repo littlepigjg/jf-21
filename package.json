@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "check": "tsc -b --noEmit"
+    "check": "tsc -b --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -27,6 +29,8 @@
   "devDependencies": {
     "@eslint/js": "^9.25.0",
     "@types/gif.js": "^0.2.5",
+    "vitest": "^3.0.0",
+    "jsdom": "^26.0.0",
     "@types/node": "^22.15.30",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",

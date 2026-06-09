@@ -30,22 +30,14 @@ export function sampleFramesByFps<T extends { delay: number }>(
     }
   }
 
-  if (sampled.length === 0 && frames.length > 0) {
+  if (sampled.length === 0) {
+    const lastFrame = frames[frames.length - 1];
     sampled.push({
-      data: frames[frames.length - 1],
+      data: lastFrame,
       delay: Math.max(accumulatedDelay, minDelay),
     });
-  } else if (accumulatedDelay > 0 && frames.length > 0) {
-    const lastFrame = frames[frames.length - 1];
-    const lastSampled = sampled[sampled.length - 1];
-    if (lastSampled && lastSampled.data === lastFrame) {
-      lastSampled.delay += accumulatedDelay;
-    } else {
-      sampled.push({
-        data: lastFrame,
-        delay: accumulatedDelay,
-      });
-    }
+  } else if (accumulatedDelay > 0) {
+    sampled[sampled.length - 1].delay += accumulatedDelay;
   }
 
   return sampled;

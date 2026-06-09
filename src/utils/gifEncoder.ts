@@ -10,6 +10,43 @@ export interface ExportProgress {
   percent: number;
 }
 
+let workerAvailabilityCache: boolean | null = null;
+
+async function checkWorkerAvailability(workerScript: string): Promise<boolean> {
+  if (workerAvailabilityCache !== null) {
+    return workerAvailabilityCache;
+  }
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const worker = new Worker(workerScript);
+      const timeoutId = setTimeout(() => {
+        worker.terminate();
+        reject(new Error('Worker load timeout'));
+      }, 3000);
+
+      worker.onmessage = () => {
+        clearTimeout(timeoutId);
+        worker.terminate();
+        resolve();
+      };
+
+      worker.onerror = () => {
+        clearTimeout(timeoutId);
+        worker.terminate();
+        reject(new Error('Worker load error'));
+      };
+
+      worker.postMessage({});
+    });
+    workerAvailabilityCache = true;
+    return true;
+  } catch {
+    workerAvailabilityCache = false;
+    return false;
+  }
+}
+
 function applyPaletteQuantization(
   frames: { imageData: ImageData; delay: number }[],
   colors: number,
@@ -47,87 +84,87 @@ function applyPaletteQuantization(
   });
 }
 
-export function exportGif(
+export async function exportGif(
   frames: Frame[],
   captions: Caption[],
   crop: CropConfig,
   exportConfig: ExportConfig,
   onProgress?: (progress: ExportProgress) => void
 ): Promise<Blob> {
-  return new Promise((resolve, reject) => {
+  const processedFrames = processAllFrames(
+    frames,
+    captions,
+    crop,
+    exportConfig.width,
+    exportConfig.height
+  );
+
+  if (processedFrames.length === 0) {
+    throw new Error('没有可用帧');
+  }
+
+  const sampledFrames = sampleProcessedFrames(processedFrames, exportConfig.fps);
+
+  if (sampledFrames.length === 0) {
+    throw new Error('帧采样失败');
+  }
+
+  const finalFrames = applyPaletteQuantization(
+    sampledFrames,
+    exportConfig.colors,
+    exportConfig.dither
+  );
+
+  const canvas = document.createElement('canvas');
+  const width = finalFrames[0].imageData.width;
+  const height = finalFrames[0].imageData.height;
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Canvas context not available');
+  }
+
+  const workerScript = '/gif.worker.js';
+  const workerAvailable = await checkWorkerAvailability(workerScript);
+
+  const gif = new GIF({
+    workers: workerAvailable ? 2 : 0,
+    quality: Math.max(1, 11 - Math.round(exportConfig.quality / 10)),
+    width,
+    height,
+    repeat: exportConfig.repeat,
+    workerScript,
+  });
+
+  return new Promise<Blob>((resolve, reject) => {
+    for (const frame of finalFrames) {
+      ctx.putImageData(frame.imageData, 0, 0);
+      gif.addFrame(ctx, { copy: true, delay: frame.delay });
+    }
+
+    gif.on('progress', (p: number) => {
+      if (onProgress) {
+        onProgress({
+          current: Math.round(p * finalFrames.length),
+          total: finalFrames.length,
+          percent: Math.round(p * 100),
+        });
+      }
+    });
+
+    gif.on('finished', (blob: Blob) => {
+      resolve(blob);
+    });
+
+    (gif as unknown as { on: (event: string, listener: (err: Error) => void) => void }).on(
+      'error',
+      (err: Error) => {
+        reject(err);
+      }
+    );
+
     try {
-      const processedFrames = processAllFrames(
-        frames,
-        captions,
-        crop,
-        exportConfig.width,
-        exportConfig.height
-      );
-
-      if (processedFrames.length === 0) {
-        reject(new Error('没有可用帧'));
-        return;
-      }
-
-      const sampledFrames = sampleProcessedFrames(processedFrames, exportConfig.fps);
-
-      if (sampledFrames.length === 0) {
-        reject(new Error('帧采样失败'));
-        return;
-      }
-
-      const finalFrames = applyPaletteQuantization(
-        sampledFrames,
-        exportConfig.colors,
-        exportConfig.dither
-      );
-
-      const canvas = document.createElement('canvas');
-      const width = finalFrames[0].imageData.width;
-      const height = finalFrames[0].imageData.height;
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        reject(new Error('Canvas context not available'));
-        return;
-      }
-
-      const gif = new GIF({
-        workers: 2,
-        quality: Math.max(1, 11 - Math.round(exportConfig.quality / 10)),
-        width,
-        height,
-        repeat: exportConfig.repeat,
-        workerScript: '/gif.worker.js',
-      });
-
-      for (const frame of finalFrames) {
-        ctx.putImageData(frame.imageData, 0, 0);
-        gif.addFrame(ctx, { copy: true, delay: frame.delay });
-      }
-
-      gif.on('progress', (p: number) => {
-        if (onProgress) {
-          onProgress({
-            current: Math.round(p * finalFrames.length),
-            total: finalFrames.length,
-            percent: Math.round(p * 100),
-          });
-        }
-      });
-
-      gif.on('finished', (blob: Blob) => {
-        resolve(blob);
-      });
-
-      (gif as unknown as { on: (event: string, listener: (err: Error) => void) => void }).on(
-        'error',
-        (err: Error) => {
-          reject(err);
-        }
-      );
-
       gif.render();
     } catch (err) {
       reject(err);
@@ -144,4 +181,8 @@ export function downloadBlob(blob: Blob, filename: string): void {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+export function resetWorkerAvailabilityCache(): void {
+  workerAvailabilityCache = null;
 }
