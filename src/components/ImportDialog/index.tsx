@@ -3,6 +3,7 @@ import { X, Upload, FileImage, Film, Images, Loader2 } from 'lucide-react';
 import { useEditorStore } from '@/stores/editorStore';
 import { decodeGif } from '@/utils/gifDecoder';
 import { loadImageFromFile, imageElementToImageData, generateId } from '@/utils/imageUtils';
+import { extractFramesFromVideo } from '@/utils/videoExtractor';
 import type { Frame } from '@/types';
 import { cn } from '@/lib/utils';
 
@@ -27,6 +28,12 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
 
   if (!open) return null;
 
+  const resetInputs = () => {
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (videoInputRef.current) videoInputRef.current.value = '';
+    if (imagesInputRef.current) imagesInputRef.current.value = '';
+  };
+
   const handleGifImport = async (file: File) => {
     setLoading(true);
     setError('');
@@ -40,66 +47,8 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
       console.error(err);
     } finally {
       setLoading(false);
+      resetInputs();
     }
-  };
-
-  const extractVideoFrames = async (file: File): Promise<Frame[]> => {
-    return new Promise((resolve, reject) => {
-      const video = document.createElement('video');
-      video.muted = true;
-      video.playsInline = true;
-      video.src = URL.createObjectURL(file);
-
-      video.onloadedmetadata = () => {
-        const duration = video.duration;
-        const totalFrames = Math.min(videoMaxFrames, Math.floor(duration * videoFps));
-        const interval = duration / totalFrames;
-        const frames: Frame[] = [];
-        let currentFrame = 0;
-
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error('Canvas context not available'));
-          return;
-        }
-
-        const extractNext = () => {
-          if (currentFrame >= totalFrames) {
-            URL.revokeObjectURL(video.src);
-            resolve(frames);
-            return;
-          }
-
-          const time = currentFrame * interval;
-          video.currentTime = time;
-
-          video.onseeked = () => {
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            frames.push({
-              id: generateId(),
-              imageData,
-              delay: Math.round(1000 / videoFps),
-              width: canvas.width,
-              height: canvas.height,
-              disposalMethod: 2,
-            });
-            currentFrame++;
-            setProgress(Math.round((currentFrame / totalFrames) * 100));
-            setTimeout(extractNext, 10);
-          };
-        };
-
-        video.onerror = () => {
-          reject(new Error('视频加载失败'));
-        };
-
-        extractNext();
-      };
-    });
   };
 
   const handleVideoImport = async (file: File) => {
@@ -107,7 +56,11 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
     setError('');
     setProgress(0);
     try {
-      const frames = await extractVideoFrames(file);
+      const frames = await extractFramesFromVideo(file, {
+        fps: videoFps,
+        maxFrames: videoMaxFrames,
+        onProgress: setProgress,
+      });
       setFrames(frames);
       onClose();
     } catch (err) {
@@ -115,6 +68,7 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
       console.error(err);
     } finally {
       setLoading(false);
+      resetInputs();
     }
   };
 
@@ -158,6 +112,7 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
       console.error(err);
     } finally {
       setLoading(false);
+      resetInputs();
     }
   };
 
@@ -172,10 +127,6 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
     } else if (mode === 'images') {
       handleImagesImport(files);
     }
-
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    if (videoInputRef.current) videoInputRef.current.value = '';
-    if (imagesInputRef.current) imagesInputRef.current.value = '';
   };
 
   return (
@@ -270,9 +221,7 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
             ) : (
               <>
                 <Upload className="w-10 h-10 text-slate-500 group-hover:text-violet-400 mx-auto mb-3 transition-colors" />
-                <p className="text-slate-300 mb-1">
-                  点击选择文件或拖拽到此处
-                </p>
+                <p className="text-slate-300 mb-1">点击选择文件或拖拽到此处</p>
                 <p className="text-xs text-slate-500">
                   {mode === 'gif' && '支持 .gif 格式'}
                   {mode === 'video' && '支持 .mp4, .webm, .mov, .avi 格式'}

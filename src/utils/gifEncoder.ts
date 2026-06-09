@@ -1,12 +1,50 @@
 import GIF from 'gif.js';
 import type { Frame, Caption, CropConfig, ExportConfig } from '@/types';
 import { processAllFrames } from './frameProcessor';
+import { sampleProcessedFrames } from './frameSampler';
 import { quantizePalette, applyDithering, findClosestColor } from './colorQuantizer';
 
 export interface ExportProgress {
   current: number;
   total: number;
   percent: number;
+}
+
+function applyPaletteQuantization(
+  frames: { imageData: ImageData; delay: number }[],
+  colors: number,
+  dither: boolean
+): { imageData: ImageData; delay: number }[] {
+  if (colors >= 256) return frames;
+
+  const imageDataList = frames.map((f) => f.imageData);
+  const palette = quantizePalette(imageDataList, colors);
+
+  return frames.map((f) => {
+    let quantizedData: ImageData;
+
+    if (dither) {
+      quantizedData = applyDithering(f.imageData, palette);
+    } else {
+      quantizedData = new ImageData(f.imageData.width, f.imageData.height);
+      for (let i = 0; i < f.imageData.data.length; i += 4) {
+        if (f.imageData.data[i + 3] > 0) {
+          const idx = findClosestColor(
+            palette,
+            f.imageData.data[i],
+            f.imageData.data[i + 1],
+            f.imageData.data[i + 2]
+          );
+          quantizedData.data[i] = palette[idx].r;
+          quantizedData.data[i + 1] = palette[idx].g;
+          quantizedData.data[i + 2] = palette[idx].b;
+          quantizedData.data[i + 3] = f.imageData.data[i + 3];
+        }
+      }
+    }
+
+    return { imageData: quantizedData, delay: f.delay };
+  });
 }
 
 export function exportGif(
@@ -18,9 +56,6 @@ export function exportGif(
 ): Promise<Blob> {
   return new Promise((resolve, reject) => {
     try {
-      const targetFps = exportConfig.fps;
-      const minDelay = Math.round(1000 / targetFps);
-
       const processedFrames = processAllFrames(
         frames,
         captions,
@@ -29,60 +64,27 @@ export function exportGif(
         exportConfig.height
       );
 
-      const selectedFrames: { imageData: ImageData; delay: number }[] = [];
-      let accumulatedDelay = 0;
-
-      for (const frame of processedFrames) {
-        accumulatedDelay += frame.delay;
-        if (accumulatedDelay >= minDelay) {
-          selectedFrames.push({
-            imageData: frame.imageData,
-            delay: accumulatedDelay,
-          });
-          accumulatedDelay = 0;
-        }
+      if (processedFrames.length === 0) {
+        reject(new Error('没有可用帧'));
+        return;
       }
 
-      if (selectedFrames.length === 0 && processedFrames.length > 0) {
-        selectedFrames.push(processedFrames[0]);
+      const sampledFrames = sampleProcessedFrames(processedFrames, exportConfig.fps);
+
+      if (sampledFrames.length === 0) {
+        reject(new Error('帧采样失败'));
+        return;
       }
 
-      let finalFrames = selectedFrames;
-
-      if (exportConfig.colors < 256) {
-        const imageDataList = selectedFrames.map((f) => f.imageData);
-        const palette = quantizePalette(imageDataList, exportConfig.colors);
-
-        finalFrames = selectedFrames.map((f) => {
-          let quantizedData: ImageData;
-
-          if (exportConfig.dither) {
-            quantizedData = applyDithering(f.imageData, palette);
-          } else {
-            quantizedData = new ImageData(f.imageData.width, f.imageData.height);
-            for (let i = 0; i < f.imageData.data.length; i += 4) {
-              if (f.imageData.data[i + 3] > 0) {
-                const idx = findClosestColor(
-                  palette,
-                  f.imageData.data[i],
-                  f.imageData.data[i + 1],
-                  f.imageData.data[i + 2]
-                );
-                quantizedData.data[i] = palette[idx].r;
-                quantizedData.data[i + 1] = palette[idx].g;
-                quantizedData.data[i + 2] = palette[idx].b;
-                quantizedData.data[i + 3] = f.imageData.data[i + 3];
-              }
-            }
-          }
-
-          return { imageData: quantizedData, delay: f.delay };
-        });
-      }
+      const finalFrames = applyPaletteQuantization(
+        sampledFrames,
+        exportConfig.colors,
+        exportConfig.dither
+      );
 
       const canvas = document.createElement('canvas');
-      const width = finalFrames[0]?.imageData.width || exportConfig.width;
-      const height = finalFrames[0]?.imageData.height || exportConfig.height;
+      const width = finalFrames[0].imageData.width;
+      const height = finalFrames[0].imageData.height;
       canvas.width = width;
       canvas.height = height;
       const ctx = canvas.getContext('2d');
@@ -93,11 +95,11 @@ export function exportGif(
 
       const gif = new GIF({
         workers: 2,
-        quality: 11 - Math.round(exportConfig.quality / 10),
+        quality: Math.max(1, 11 - Math.round(exportConfig.quality / 10)),
         width,
         height,
         repeat: exportConfig.repeat,
-        workerScript: 'https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.worker.js',
+        workerScript: '/gif.worker.js',
       });
 
       for (const frame of finalFrames) {
