@@ -3,6 +3,7 @@ import type { Frame, Caption, CropConfig, ExportConfig } from '@/types';
 import { processAllFrames } from './frameProcessor';
 import { sampleProcessedFrames } from './frameSampler';
 import { quantizePalette, applyDithering, findClosestColor } from './colorQuantizer';
+import { encodeGifMainThread } from './gif/mainThreadEncoder';
 
 export interface ExportProgress {
   current: number;
@@ -17,27 +18,63 @@ async function checkWorkerAvailability(workerScript: string): Promise<boolean> {
     return workerAvailabilityCache;
   }
 
+  if (typeof Worker === 'undefined') {
+    workerAvailabilityCache = false;
+    return false;
+  }
+
   try {
     await new Promise<void>((resolve, reject) => {
-      const worker = new Worker(workerScript);
+      let resolved = false;
+      let worker: Worker | null = null;
+
       const timeoutId = setTimeout(() => {
-        worker.terminate();
-        reject(new Error('Worker load timeout'));
+        if (!resolved && worker) {
+          worker.terminate();
+          worker = null;
+          reject(new Error('Worker load timeout'));
+        }
       }, 3000);
 
-      worker.onmessage = () => {
+      const cleanup = () => {
         clearTimeout(timeoutId);
-        worker.terminate();
+        if (worker) {
+          worker.terminate();
+          worker = null;
+        }
+      };
+
+      try {
+        worker = new Worker(workerScript);
+      } catch (err) {
+        clearTimeout(timeoutId);
+        reject(err);
+        return;
+      }
+
+      worker.onmessage = () => {
+        if (resolved) return;
+        resolved = true;
+        cleanup();
         resolve();
       };
 
       worker.onerror = () => {
-        clearTimeout(timeoutId);
-        worker.terminate();
+        if (resolved) return;
+        resolved = true;
+        cleanup();
         reject(new Error('Worker load error'));
       };
 
-      worker.postMessage({});
+      try {
+        worker.postMessage({});
+      } catch (err) {
+        if (!resolved) {
+          resolved = true;
+          cleanup();
+          reject(err);
+        }
+      }
     });
     workerAvailabilityCache = true;
     return true;
@@ -84,6 +121,110 @@ function applyPaletteQuantization(
   });
 }
 
+async function exportWithWorker(
+  finalFrames: { imageData: ImageData; delay: number }[],
+  exportConfig: ExportConfig,
+  onProgress?: (progress: ExportProgress) => void
+): Promise<Blob> {
+  const width = finalFrames[0].imageData.width;
+  const height = finalFrames[0].imageData.height;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Canvas context not available');
+  }
+
+  const gifOptions: ConstructorParameters<typeof GIF>[0] = {
+    workers: 2,
+    quality: Math.max(1, 11 - Math.round(exportConfig.quality / 10)),
+    width,
+    height,
+    repeat: exportConfig.repeat,
+    workerScript: '/gif.worker.js',
+  };
+
+  const gif = new GIF(gifOptions);
+
+  for (const frame of finalFrames) {
+    ctx.putImageData(frame.imageData, 0, 0);
+    gif.addFrame(ctx, { copy: true, delay: frame.delay });
+  }
+
+  return new Promise<Blob>((resolve, reject) => {
+    let settled = false;
+
+    const timeoutId = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { gif.abort(); } catch (_) { /* ignore */ }
+        reject(new Error('GIF encoding timeout'));
+      }
+    }, 60000);
+
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+    };
+
+    gif.on('progress', (p: number) => {
+      if (settled) return;
+      if (onProgress) {
+        onProgress({
+          current: Math.round(p * finalFrames.length),
+          total: finalFrames.length,
+          percent: Math.round(p * 100),
+        });
+      }
+    });
+
+    gif.on('finished', (blob: Blob) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(blob);
+    });
+
+    (gif as unknown as { on: (event: string, listener: (err: Error) => void) => void }).on(
+      'error',
+      (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try { gif.abort(); } catch (_) { /* ignore */ }
+        reject(err);
+      }
+    );
+
+    try {
+      gif.render();
+    } catch (err) {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        reject(err);
+      }
+    }
+  });
+}
+
+async function exportWithMainThread(
+  finalFrames: { imageData: ImageData; delay: number }[],
+  exportConfig: ExportConfig,
+  onProgress?: (progress: ExportProgress) => void
+): Promise<Blob> {
+  return encodeGifMainThread(
+    finalFrames.map((f) => ({ imageData: f.imageData, delay: f.delay })),
+    {
+      repeat: exportConfig.repeat,
+      quality: Math.max(1, 11 - Math.round(exportConfig.quality / 10)),
+      dither: false,
+      onProgress,
+    }
+  );
+}
+
 export async function exportGif(
   frames: Frame[],
   captions: Caption[],
@@ -115,61 +256,18 @@ export async function exportGif(
     exportConfig.dither
   );
 
-  const canvas = document.createElement('canvas');
-  const width = finalFrames[0].imageData.width;
-  const height = finalFrames[0].imageData.height;
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    throw new Error('Canvas context not available');
+  const workerAvailable = await checkWorkerAvailability('/gif.worker.js');
+
+  if (workerAvailable) {
+    try {
+      return await exportWithWorker(finalFrames, exportConfig, onProgress);
+    } catch (workerErr) {
+      console.warn('Worker mode failed, falling back to main thread:', workerErr);
+      resetWorkerAvailabilityCache();
+    }
   }
 
-  const workerScript = '/gif.worker.js';
-  const workerAvailable = await checkWorkerAvailability(workerScript);
-
-  const gif = new GIF({
-    workers: workerAvailable ? 2 : 0,
-    quality: Math.max(1, 11 - Math.round(exportConfig.quality / 10)),
-    width,
-    height,
-    repeat: exportConfig.repeat,
-    workerScript,
-  });
-
-  return new Promise<Blob>((resolve, reject) => {
-    for (const frame of finalFrames) {
-      ctx.putImageData(frame.imageData, 0, 0);
-      gif.addFrame(ctx, { copy: true, delay: frame.delay });
-    }
-
-    gif.on('progress', (p: number) => {
-      if (onProgress) {
-        onProgress({
-          current: Math.round(p * finalFrames.length),
-          total: finalFrames.length,
-          percent: Math.round(p * 100),
-        });
-      }
-    });
-
-    gif.on('finished', (blob: Blob) => {
-      resolve(blob);
-    });
-
-    (gif as unknown as { on: (event: string, listener: (err: Error) => void) => void }).on(
-      'error',
-      (err: Error) => {
-        reject(err);
-      }
-    );
-
-    try {
-      gif.render();
-    } catch (err) {
-      reject(err);
-    }
-  });
+  return exportWithMainThread(finalFrames, exportConfig, onProgress);
 }
 
 export function downloadBlob(blob: Blob, filename: string): void {
